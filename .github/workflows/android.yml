@@ -44,41 +44,62 @@ jobs:
       - name: Собрать debug и release APK
         run: ./gradlew assembleDebug assembleRelease --stacktrace
 
-      - name: Переименовать debug APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/ZI-Voice-debug.apk
-
-      # Опционально: подпись релизного APK секретами репозитория.
-      # Шаг выполняется только если задан секрет APK_KEYSTORE_BASE64.
-      # Нужные секреты: APK_KEYSTORE_BASE64, APK_KEYSTORE_PASSWORD, APK_KEY_ALIAS, APK_KEY_PASSWORD
-      - name: Подписать release APK (если настроены секреты)
+      # Постоянный ключ подписи ZI-Voice (подробности: SIGNING.md).
+      # Источник ключа (по приоритету):
+      #   1) секреты репозитория: APK_KEYSTORE_BASE64, APK_KEYSTORE_PASSWORD, APK_KEY_ALIAS, APK_KEY_PASSWORD
+      #   2) файл в репозитории: signing/zi-voice.keystore + signing/keystore-password.txt
+      # Одним ключом подписываются и debug, и release APK, поэтому любая новая
+      # сборка ставится поверх предыдущей как обновление.
+      - name: Подписать APK постоянным ключом
         env:
           KEYSTORE_B64: ${{ secrets.APK_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.APK_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.APK_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.APK_KEY_PASSWORD }}
-        if: env.KEYSTORE_B64 != ''
         run: |
           BT="$ANDROID_HOME/build-tools/35.0.0"
-          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/zi-voice.keystore"
-          "$BT/zipalign" -f -p 4 \
-            app/build/outputs/apk/release/app-release-unsigned.apk \
-            app/build/outputs/apk/release/app-release-aligned.apk
-          "$BT/apksigner" sign \
-            --ks "$RUNNER_TEMP/zi-voice.keystore" \
-            --ks-key-alias "$KEY_ALIAS" \
-            --ks-pass "pass:$KEYSTORE_PASSWORD" \
-            --key-pass "pass:$KEY_PASSWORD" \
-            --out app/build/outputs/apk/release/ZI-Voice-release.apk \
-            app/build/outputs/apk/release/app-release-aligned.apk
-
-      - name: Переименовать release APK
-        run: |
-          cd app/build/outputs/apk/release
-          if [ -f ZI-Voice-release.apk ]; then
-            echo "APK подписан через секреты"
-          else
-            cp app-release-unsigned.apk ZI-Voice-release-unsigned.apk
+          KS=""; KSPASS=""; KSALIAS="zi-voice"; KPPASS=""
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/zi-voice.keystore"
+            KS="$RUNNER_TEMP/zi-voice.keystore"
+            KSPASS="$KEYSTORE_PASSWORD"
+            KSALIAS="${KEY_ALIAS:-zi-voice}"
+            KPPASS="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+            echo "Источник ключа: секреты репозитория"
+          elif [ -f signing/zi-voice.keystore ]; then
+            KS="signing/zi-voice.keystore"
+            KSPASS="$(cat signing/keystore-password.txt)"
+            KSALIAS="${KEY_ALIAS:-zi-voice}"
+            KPPASS="$KSPASS"
+            echo "Источник ключа: файл signing/zi-voice.keystore из репозитория"
           fi
+          if [ -z "$KS" ]; then
+            echo "::warning::Ключ подписи не найден (нет секретов и файла signing/zi-voice.keystore) — APK останутся подписанными отладочным ключом Gradle"
+          else
+            sign_one () {
+              local src="$1" dst="$2"
+              "$BT/zipalign" -f -p 4 "$src" "$RUNNER_TEMP/aligned.apk"
+              "$BT/apksigner" sign \
+                --ks "$KS" \
+                --ks-key-alias "$KSALIAS" \
+                --ks-pass "pass:$KSPASS" \
+                --key-pass "pass:$KPPASS" \
+                --out "$dst" "$RUNNER_TEMP/aligned.apk"
+            }
+            sign_one app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/ZI-Voice-debug.apk
+            sign_one app/build/outputs/apk/release/app-release-unsigned.apk app/build/outputs/apk/release/ZI-Voice-release.apk
+            echo "=== Сертификат подписи (debug) ==="
+            "$BT/apksigner" verify --print-certs app/build/outputs/apk/debug/ZI-Voice-debug.apk
+            echo "=== Сертификат подписи (release) ==="
+            "$BT/apksigner" verify --print-certs app/build/outputs/apk/release/ZI-Voice-release.apk
+          fi
+
+      - name: Переименовать APK
+        run: |
+          cd app/build/outputs/apk
+          [ -f debug/ZI-Voice-debug.apk ] || cp debug/app-debug.apk debug/ZI-Voice-debug.apk
+          [ -f release/ZI-Voice-release.apk ] || cp release/app-release-unsigned.apk release/ZI-Voice-release-unsigned.apk
+          ls -la debug release
 
       - name: Загрузить артефакт ZI-Voice-debug
         uses: actions/upload-artifact@v4
@@ -118,5 +139,9 @@ jobs:
             --title "ZI-Voice $GITHUB_REF_NAME" \
             --notes "Автоматическая сборка для тега $GITHUB_REF_NAME.
 
-          - ZI-Voice-debug.apk — debug-сборка (устанавливается на любое устройство)
-          - ZI-Voice-release-unsigned.apk — релизная сборка без подписи (для публикации нужно подписать)"
+          - ZI-Voice-debug.apk — debug-сборка
+          - ZI-Voice-release.apk — релизная сборка
+
+          Оба APK подписаны постоянным ключом ZI-Voice (см. SIGNING.md)
+          и устанавливаются поверх предыдущих версий как обновление.
+          Перед установкой новой версии увеличьте versionCode в app/build.gradle.kts."

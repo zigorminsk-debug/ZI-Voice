@@ -39,27 +39,12 @@ git tag v0.1.0 && git push origin v0.1.0
 # результат: app/build/outputs/apk/debug/app-debug.apk
 ```
 
-### Подпись релизных APK (опционально)
+### Подпись (постоянный ключ — уже настроен)
 
-Чтобы релизный APK был сразу подписан, добавьте 4 секрета репозитория
-(**Settings → Secrets and variables → Actions**):
-
-| Секрет | Значение |
-|---|---|
-| `APK_KEYSTORE_BASE64` | keystore в base64 |
-| `APK_KEYSTORE_PASSWORD` | пароль keystore |
-| `APK_KEY_ALIAS` | алиас ключа |
-| `APK_KEY_PASSWORD` | пароль ключа |
-
-Создать keystore и получить base64:
-
-```bash
-keytool -genkeypair -v -keystore zi-voice.keystore -alias zi-voice \
-  -keyalg RSA -keysize 2048 -validity 10000
-base64 -w0 zi-voice.keystore > zi-voice.keystore.b64
-```
-
-Если секреты не заданы — релизный APK просто собирается неподписанным, сборка не падает.
+Все APK, собираемые CI, подписываются **постоянным ключом** из `signing/` —
+поэтому каждая новая сборка устанавливается поверх предыдущей как обновление.
+Подробности и правила работы с ключом: **[SIGNING.md](SIGNING.md)** (обязательно
+к прочтению перед изменениями в `signing/`).
 
 ## Технологии
 
