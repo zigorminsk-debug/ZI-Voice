@@ -99,6 +99,8 @@ jobs:
               echo '```'
               echo "Ожидаемый SHA-256: \`96:0C:FF:48:9F:12:0C:6E:5E:55:1A:81:D7:50:8B:5F:1D:D7:75:43:3E:C4:48:5F:C7:10:CA:E4:3F:77:2F:0D\`"
             } >> "$GITHUB_STEP_SUMMARY"
+            FP=$("$BT/apksigner" verify --print-certs app/build/outputs/apk/release/ZI-Voice-release.apk | grep -m1 "certificate SHA-256" | sed 's/.*: //')
+            echo "::notice title=Подпись APK постоянным ключом::${FP}"
           fi
 
       - name: Переименовать APK
