@@ -27,8 +27,15 @@ render.experimental.xml
 *.jks
 *.keystore
 
+# Исключение: постоянный ключ подписи ZI-Voice хранится в репозитории намеренно (см. SIGNING.md)
+!signing/zi-voice.keystore
+!signing/zi-voice.keystore.b64
+
 # Google Services (e.g. APIs or Firebase)
 google-services.json
 
 # Android Profiling
 *.hprof
+
+# Kotlin/Native and Kotlin 2.x build dirs
+.kotlin/
