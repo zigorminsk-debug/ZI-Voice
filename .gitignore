@@ -32,3 +32,6 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+# Kotlin/Native and Kotlin 2.x build dirs
+.kotlin/
