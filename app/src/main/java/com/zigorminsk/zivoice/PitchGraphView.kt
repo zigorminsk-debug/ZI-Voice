@@ -103,7 +103,7 @@ class PitchGraphView(context: Context) : View(context) {
     /** Обновить точки отклонения (points[i] — время (i+1)*chunkSec). */
     fun setPoints(points: FloatArray, count: Int) {
         dev = points
-        pointCount = count
+        pointCount = count.coerceIn(0, points.size)
         invalidate()
     }
 

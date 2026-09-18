@@ -3,6 +3,7 @@ package com.zigorminsk.zivoice
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.media.AudioAttributes
@@ -30,11 +31,15 @@ private const val COUNTDOWN_BEATS = 4
 private const val TAIL_SEC = 0.9f
 private const val OCTAVE_CENTS = 600f
 
+/** Размер буфера анализа: окно YIN + максимальный лаг (SAMPLE_RATE/60). */
+private val ANALYSIS_SIZE = CHUNK + SAMPLE_RATE / 60
+
 class MainActivity : Activity() {
 
     private var exerciseIndex = 0
-    private var running = false
-    private var refPlaying = false
+    @Volatile private var running = false
+    @Volatile private var manualStop = false
+    @Volatile private var refPlaying = false
 
     private var micThread: Thread? = null
     private var audioThread: Thread? = null
@@ -45,7 +50,6 @@ class MainActivity : Activity() {
     private var runStarts = FloatArray(0)
     private var runEnds = FloatArray(0)
     private var runNames = emptyArray<String>()
-    private var runTargetMidi = IntArray(0)
     private var runCountdownSec = 0f
     private var graphPoints: FloatArray = FloatArray(0)
 
@@ -62,6 +66,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(buildUi())
         showExercise()
+        showLastCrashIfAny()
     }
 
     override fun onDestroy() {
@@ -79,9 +84,11 @@ class MainActivity : Activity() {
         gravity = Gravity.CENTER
     }
 
+    private fun grey(): Int = Color.rgb(150, 158, 168)
+
     private fun buildUi(): LinearLayout {
         val white = Color.WHITE
-        val grey = Color.rgb(150, 158, 168)
+        val grey = grey()
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -196,7 +203,20 @@ class MainActivity : Activity() {
         graph.setPoints(FloatArray(0), 0)
     }
 
-    private fun grey(): Int = Color.rgb(150, 158, 168)
+    /** Показать причину прошлого сбоя (если был). */
+    private fun showLastCrashIfAny() {
+        val text = try {
+            openFileInput("last_crash.txt").bufferedReader().use { it.readText() }
+        } catch (_: Exception) {
+            null
+        } ?: return
+        AlertDialog.Builder(this)
+            .setTitle("Прошлый сбой")
+            .setMessage(text.take(1400))
+            .setPositiveButton("Понятно") { _, _ -> deleteFile("last_crash.txt") }
+            .setCancelable(true)
+            .show()
+    }
 
     // ---------- Прослушивание эталона ----------
 
@@ -207,14 +227,15 @@ class MainActivity : Activity() {
         }
         if (running) stopRun()
         val ex = ExerciseLibrary.all[exerciseIndex]
-        val pcm = renderExerciseAudio(ex, withNotes = true, tickAmp = 0.30f)
         refPlaying = true
         listenButton.text = "■ Стоп"
         statusText.text = "Прослушивание: ${ex.name}"
         audioThread = Thread {
+            val pcm = renderExerciseAudio(ex, withNotes = true, tickAmp = 0.30f)
             playPcm(pcm)
             runOnUiThread {
                 refPlaying = false
+                if (isDestroyed || isFinishing) return@runOnUiThread
                 listenButton.text = "♪ Прослушать"
                 statusText.text = "Теперь пойте сами — нажмите «Старт»"
             }
@@ -248,11 +269,9 @@ class MainActivity : Activity() {
         runStarts = FloatArray(n)
         runEnds = FloatArray(n)
         runNames = arrayOfNulls<String>(n).requireNoNulls()
-        runTargetMidi = IntArray(n)
         var t = countdownSec
         for (i in 0 until n) {
             runStarts[i] = t
-            runTargetMidi[i] = ex.steps[i].midi
             runNames[i] = noteName(ex.steps[i].midi)
             t += ex.steps[i].beats * beat
             runEnds[i] = t
@@ -268,101 +287,123 @@ class MainActivity : Activity() {
         startButton.text = "■ Стоп"
         listenButton.isEnabled = false
 
-        val minBuffer = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-        )
-        if (minBuffer <= 0) {
-            toastAndReset("Микрофон недоступен")
-            return
-        }
-        val record = AudioRecord(
-            MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-            maxOf(minBuffer, CHUNK * 4)
-        )
-        if (record.state != AudioRecord.STATE_INITIALIZED) {
-            record.release()
-            toastAndReset("Не удалось открыть микрофон")
-            return
-        }
-        audioRecord = record
+        // Флаг ставим сразу — защита от двойного нажатия
         running = true
+        manualStop = false
 
-        // Тихий метроном на весь запуск: громкие отсчёты + тихие доли
-        val monitorPcm = renderExerciseAudio(ex, withNotes = false, tickAmp = 0.13f)
-        audioThread = Thread { playPcm(monitorPcm) }.also { it.start() }
+        micThread = Thread { runSession(ex, points, maxPoints, chunkSec) }.also { it.start() }
+    }
 
-        micThread = Thread {
-            val sig = FloatArray(CHUNK)
+    /** Весь аудио-путь в фоновом потоке: создание, запись, обработка. */
+    @SuppressLint("MissingPermission")
+    private fun runSession(ex: Exercise, points: FloatArray, maxPoints: Int, chunkSec: Float) {
+        var record: AudioRecord? = null
+        var idx = 0
+        try {
+            val minBuffer = AudioRecord.getMinBufferSize(
+                SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+            )
+            if (minBuffer <= 0) {
+                runOnUiThread { toastAndReset("Микрофон недоступен") }
+                return
+            }
+            val rec = AudioRecord(
+                MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+                maxOf(minBuffer, CHUNK * 4)
+            )
+            if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                rec.release()
+                runOnUiThread { toastAndReset("Микрофон занят другим приложением") }
+                return
+            }
+            record = rec
+            audioRecord = rec
+
+            // Тихий метроном: громкие отсчёты + тихие доли мелодии
+            if (running) {
+                val monitorPcm = renderExerciseAudio(ex, withNotes = false, tickAmp = 0.13f)
+                audioThread = Thread { playPcm(monitorPcm) }.also { it.start() }
+            }
+
+            rec.startRecording()
+
             val buffer = ShortArray(CHUNK)
+            val analysis = FloatArray(ANALYSIS_SIZE) // перекрывающийся буфер
             val lastMidi = FloatArray(3) { Float.NaN }
-            var idx = 0
-            try {
-                record.startRecording()
-                while (running && idx < maxPoints) {
-                    val read = record.read(buffer, 0, CHUNK)
-                    if (read <= 0) {
-                        try {
-                            Thread.sleep(15)
-                        } catch (_: InterruptedException) {
-                            break
-                        }
-                        continue
-                    }
-                    var sumSquares = 0.0
-                    for (i in 0 until read) {
-                        val v = buffer[i] / 32768f
-                        sig[i] = v
-                        sumSquares += v.toDouble() * v.toDouble()
-                    }
-                    val rms = Math.sqrt(sumSquares / read).toFloat()
-                    val freq =
-                        if (rms >= RMS_SILENCE) PitchDetector.detect(sig, SAMPLE_RATE) else null
 
-                    // Медиана трёх последних оценок — убирает скачки октавы
-                    if (freq != null) {
-                        val midi = (69.0 + 12.0 * ln(freq / 440.0) / ln(2.0)).toFloat()
-                        lastMidi[0] = lastMidi[1]
-                        lastMidi[1] = lastMidi[2]
-                        lastMidi[2] = midi
-                    } else {
-                        lastMidi[0] = Float.NaN
-                        lastMidi[1] = Float.NaN
-                        lastMidi[2] = Float.NaN
+            while (running && idx < maxPoints) {
+                val read = rec.read(buffer, 0, CHUNK)
+                if (read <= 0) {
+                    try {
+                        Thread.sleep(15)
+                    } catch (_: InterruptedException) {
+                        break
                     }
-                    val med = median3(lastMidi)
-
-                    val tNow = (idx + 1) * chunkSec
-                    val tMelody = tNow - countdownSec
-                    val target = targetAt(tMelody, ex)
-                    points[idx] = if (!med.isNaN() && target != null) {
-                        ((med - target) * 100).toFloat()
-                    } else Float.NaN
-
-                    val devNow = points[idx]
-                    val targetNow = target
-                    val snapshot = idx + 1
-                    runOnUiThread { updateLive(tMelody, targetNow, devNow, snapshot) }
-                    idx++
-                    if (tMelody > ex.totalSec) break
+                    continue
                 }
-            } catch (_: SecurityException) {
-            } finally {
+                var sumSquares = 0.0
+                // сдвигаем перекрытие и дописываем новые сэмплы
+                System.arraycopy(analysis, read, analysis, 0, ANALYSIS_SIZE - read)
+                for (i in 0 until read) {
+                    val v = buffer[i] / 32768f
+                    analysis[ANALYSIS_SIZE - read + i] = v
+                    sumSquares += v.toDouble() * v.toDouble()
+                }
+                val rms = Math.sqrt(sumSquares / read).toFloat()
+                val freq =
+                    if (rms >= RMS_SILENCE) PitchDetector.detect(analysis, SAMPLE_RATE) else null
+
+                // Медиана трёх последних оценок — убирает скачки октавы
+                if (freq != null) {
+                    val midi = (69.0 + 12.0 * ln(freq / 440.0) / ln(2.0)).toFloat()
+                    lastMidi[0] = lastMidi[1]
+                    lastMidi[1] = lastMidi[2]
+                    lastMidi[2] = midi
+                } else {
+                    lastMidi[0] = Float.NaN
+                    lastMidi[1] = Float.NaN
+                    lastMidi[2] = Float.NaN
+                }
+                val med = median3(lastMidi)
+
+                val tNow = (idx + 1) * chunkSec
+                val tMelody = tNow - runCountdownSec
+                val target = targetAt(tMelody, ex)
+                points[idx] = if (!med.isNaN() && target != null) {
+                    ((med - target) * 100).toFloat()
+                } else Float.NaN
+
+                val devNow = points[idx]
+                val targetNow = target
+                val snapshot = idx + 1
+                runOnUiThread { updateLive(tMelody, targetNow, devNow, snapshot) }
+                idx++
+                if (tMelody > ex.totalSec) break
+            }
+        } catch (e: SecurityException) {
+            runOnUiThread { toastAndReset("Нет разрешения на микрофон") }
+        } catch (e: Exception) {
+            runOnUiThread { toastAndReset("Ошибка микрофона: " + e.javaClass.simpleName) }
+        } finally {
+            record?.let {
                 try {
-                    record.stop()
+                    it.stop()
                 } catch (_: IllegalStateException) {
                 }
-                record.release()
-                audioRecord = null
+                try {
+                    it.release()
+                } catch (_: Exception) {
+                }
             }
-            val captured = points
-            val count = idx
-            val starts = runStarts
-            val ends = runEnds
-            val names = runNames
-            val countdown = runCountdownSec
-            runOnUiThread { finishRun(captured, count, starts, ends, names, countdown, ex) }
-        }.also { it.start() }
+            audioRecord = null
+        }
+        val captured = points
+        val starts = runStarts
+        val ends = runEnds
+        val names = runNames
+        val countdown = runCountdownSec
+        runOnUiThread { finishRun(captured, idx, starts, ends, names, countdown, ex) }
     }
 
     private fun targetAt(tMelody: Float, ex: Exercise): Int? {
@@ -428,6 +469,11 @@ class MainActivity : Activity() {
         running = false
         startButton.text = "● Старт"
         listenButton.isEnabled = true
+        if (manualStop) {
+            manualStop = false
+            hintText.text = ""
+            return
+        }
         currentNoteText.text = "Готово"
         hintText.text = ""
 
@@ -553,41 +599,46 @@ class MainActivity : Activity() {
     }
 
     private fun playPcm(pcm: ShortArray) {
-        val minBuf = AudioTrack.getMinBufferSize(
-            SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
-        )
-        val track = AudioTrack(
-            AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                .build(),
-            AudioFormat.Builder()
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(SAMPLE_RATE)
-                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                .build(),
-            maxOf(minBuf, pcm.size * 2),
-            AudioTrack.MODE_STREAM,
-            AudioManager.AUDIO_SESSION_ID_GENERATE
-        )
-        audioTrack = track
+        var track: AudioTrack? = null
         try {
+            val minBuf = AudioTrack.getMinBufferSize(
+                SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+            )
+            track = AudioTrack(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build(),
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SAMPLE_RATE)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build(),
+                maxOf(minBuf, 16384),
+                AudioTrack.MODE_STREAM,
+                AudioManager.AUDIO_SESSION_ID_GENERATE
+            )
+            audioTrack = track
             track.play()
             track.write(pcm, 0, pcm.size)
-        } catch (_: IllegalStateException) {
-        }
-        try {
             while (audioTrack === track && track.playbackHeadPosition < pcm.size) {
                 Thread.sleep(60)
             }
-        } catch (_: InterruptedException) {
+        } catch (_: Exception) {
+            // воспроизведение необязательно — не даём упасть потоку
+        } finally {
+            if (audioTrack === track) audioTrack = null
+            track?.let {
+                try {
+                    it.stop()
+                } catch (_: IllegalStateException) {
+                }
+                try {
+                    it.release()
+                } catch (_: Exception) {
+                }
+            }
         }
-        try {
-            track.stop()
-        } catch (_: IllegalStateException) {
-        }
-        track.release()
-        if (audioTrack === track) audioTrack = null
     }
 
     private fun stopAudioPlayback() {
@@ -603,6 +654,7 @@ class MainActivity : Activity() {
     }
 
     private fun stopRun() {
+        manualStop = running
         running = false
         stopAudioPlayback()
         audioRecord?.let { rec ->
@@ -611,9 +663,6 @@ class MainActivity : Activity() {
             } catch (_: IllegalStateException) {
             }
         }
-        micThread?.let { it.interrupt(); it.join(1200) }
-        micThread = null
-        audioRecord = null
         startButton.text = "● Старт"
         listenButton.isEnabled = true
         statusText.text = "Остановлено"
@@ -623,7 +672,6 @@ class MainActivity : Activity() {
 
     private fun stopEverything() {
         running = false
-        refPlaying = false
         stopAudioPlayback()
         audioRecord?.let { rec ->
             try {
@@ -631,15 +679,16 @@ class MainActivity : Activity() {
             } catch (_: IllegalStateException) {
             }
         }
-        micThread?.interrupt()
-        micThread = null
         audioRecord = null
     }
 
     private fun toastAndReset(message: String) {
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+        running = false
+        manualStop = false
         startButton.text = "● Старт"
         listenButton.isEnabled = true
+        statusText.text = message
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
     override fun onRequestPermissionsResult(
